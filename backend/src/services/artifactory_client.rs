@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
 
+use crate::services::proxy_service::redact_url_for_diagnostics;
+use crate::services::source_registry::{normalize_source_base_url, PingOutcome, PingProbe};
+
 /// Errors that can occur when interacting with Artifactory
 #[derive(Error, Debug)]
 pub enum ArtifactoryError {
@@ -396,7 +399,10 @@ fn download_uri_is_safe_to_follow(download_uri: &str) -> bool {
 
 impl ArtifactoryClient {
     /// Create a new Artifactory client with the given configuration
-    pub fn new(config: ArtifactoryClientConfig) -> Result<Self, ArtifactoryError> {
+    pub fn new(mut config: ArtifactoryClientConfig) -> Result<Self, ArtifactoryError> {
+        // Request URLs are `{base_url}{path}`: keep a trailing slash on the
+        // base from doubling the separator (#5479).
+        config.base_url = normalize_source_base_url(&config.base_url);
         // Enforce HTTPS unless explicitly opted out for local dev
         let allow_http = std::env::var("ALLOW_HTTP_INTEGRATIONS")
             .map(|v| v == "1" || v == "true")
@@ -637,23 +643,36 @@ impl ArtifactoryClient {
     /// Access service's `/access/api/v1/system/ping`, so a single-endpoint
     /// probe wrongly reported those instances as unreachable.
     pub async fn ping(&self) -> Result<bool, ArtifactoryError> {
+        Ok(self.ping_detailed().await?.is_reachable())
+    }
+
+    /// [`Self::ping`], reporting every probed URL and the HTTP status it
+    /// answered with when none succeeded, so a connection test can say why it
+    /// failed (#5479).
+    pub async fn ping_detailed(&self) -> Result<PingOutcome, ArtifactoryError> {
         let mut last_err: Option<ArtifactoryError> = None;
+        let mut probes = Vec::new();
         for url in ping_candidate_urls(&self.config.base_url) {
             // The whole-request ceiling, so a connection test cannot be held
             // open indefinitely by a source that answers one byte at a time.
             let request = self.buffered(self.auth_request(self.client.get(&url)));
             match request.send().await {
-                Ok(response) if response.status().is_success() => return Ok(true),
+                Ok(response) if response.status().is_success() => {
+                    return Ok(PingOutcome::Reachable)
+                }
                 // Non-success: this deployment does not answer this ping
                 // shape; try the next candidate.
-                Ok(_) => {}
+                Ok(response) => probes.push(PingProbe {
+                    url: redact_url_for_diagnostics(&url),
+                    status: response.status().as_u16(),
+                }),
                 Err(e) => last_err = Some(ArtifactoryError::HttpError(e)),
             }
         }
         match last_err {
             // The host answered every candidate, just never successfully —
             // same `Ok(false)` the old single-endpoint probe reported.
-            None => Ok(false),
+            None => Ok(PingOutcome::Unsuccessful { probes }),
             // At least one candidate failed at the transport level and none
             // succeeded: surface the error, as before.
             Some(e) => Err(e),
@@ -955,6 +974,10 @@ impl ArtifactoryClient {
 impl crate::services::source_registry::SourceRegistry for ArtifactoryClient {
     async fn ping(&self) -> Result<bool, ArtifactoryError> {
         self.ping().await
+    }
+
+    async fn ping_detailed(&self) -> Result<PingOutcome, ArtifactoryError> {
+        self.ping_detailed().await
     }
 
     async fn get_version(&self) -> Result<SystemVersionResponse, ArtifactoryError> {
@@ -1348,6 +1371,21 @@ mod tests {
 
         let client = test_client(server.uri());
         assert!(!client.ping().await.expect("ping must not error"));
+
+        // The detailed probe reports every shape it tried and its status, so
+        // a connection test can say why it failed (#5479).
+        match client.ping_detailed().await.expect("ping must not error") {
+            PingOutcome::Unsuccessful { probes } => {
+                let got: Vec<(String, u16)> =
+                    probes.into_iter().map(|p| (p.url, p.status)).collect();
+                let want: Vec<(String, u16)> = ping_candidate_urls(&server.uri())
+                    .into_iter()
+                    .map(|u| (u, 404))
+                    .collect();
+                assert_eq!(got, want);
+            }
+            PingOutcome::Reachable => panic!("no ping shape answered"),
+        }
     }
 
     /// The classic endpoint still wins on deployments that serve it — no
@@ -1516,6 +1554,21 @@ mod tests {
         };
         let client = ArtifactoryClient::new(config);
         assert!(client.is_ok());
+    }
+
+    /// A trailing slash on the stored URL must not produce `//api/...`
+    /// request paths (#5479).
+    #[test]
+    fn test_client_creation_normalizes_base_url() {
+        let client = ArtifactoryClient::new(ArtifactoryClientConfig {
+            base_url: " https://artifactory.example.com/artifactory/ ".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            client.config.base_url,
+            "https://artifactory.example.com/artifactory"
+        );
     }
 
     #[test]

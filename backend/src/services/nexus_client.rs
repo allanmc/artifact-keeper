@@ -16,6 +16,7 @@ use crate::services::artifactory_client::{
     MIGRATION_SOURCE_READ_TIMEOUT_ENV,
 };
 use crate::services::proxy_service::redact_url_for_diagnostics;
+use crate::services::source_registry::{normalize_source_base_url, PingOutcome, PingProbe};
 
 /// Nexus authentication credentials
 #[derive(Debug, Clone)]
@@ -225,7 +226,10 @@ pub struct NexusChecksum {
 
 impl NexusClient {
     /// Create a new Nexus client
-    pub fn new(config: NexusClientConfig) -> Result<Self, ArtifactoryError> {
+    pub fn new(mut config: NexusClientConfig) -> Result<Self, ArtifactoryError> {
+        // Every request URL is `{base_url}{path}`; a trailing slash on the
+        // base made each one `//service/...`, which Nexus 404s (#5479).
+        config.base_url = normalize_source_base_url(&config.base_url);
         // `timeout()` covers reading the body, so it killed any download that
         // took longer than it, reported as "error decoding response body". That
         // made the real size limit depend on throughput. Bound the connect and
@@ -400,6 +404,12 @@ impl NexusClient {
     /// should report the source's current state, not spend the retry budget
     /// before answering.
     pub async fn ping(&self) -> Result<bool, ArtifactoryError> {
+        Ok(self.ping_detailed().await?.is_reachable())
+    }
+
+    /// [`Self::ping`], reporting the probed URL and HTTP status on failure so a
+    /// connection test can say why it failed (#5479).
+    pub async fn ping_detailed(&self) -> Result<PingOutcome, ArtifactoryError> {
         let url = format!("{}/service/rest/v1/status/writable", self.config.base_url);
         let response = self
             .client
@@ -407,7 +417,17 @@ impl NexusClient {
             .basic_auth(&self.config.auth.username, Some(&self.config.auth.password))
             .send()
             .await?;
-        Ok(response.status().is_success())
+        let status = response.status();
+        Ok(if status.is_success() {
+            PingOutcome::Reachable
+        } else {
+            PingOutcome::Unsuccessful {
+                probes: vec![PingProbe {
+                    url: redact_url_for_diagnostics(&url),
+                    status: status.as_u16(),
+                }],
+            }
+        })
     }
 
     /// Nexus version: try the status endpoint, fall back to the OpenAPI doc, then "unknown".
@@ -773,6 +793,10 @@ impl crate::services::source_registry::SourceRegistry for NexusClient {
         self.ping().await
     }
 
+    async fn ping_detailed(&self) -> Result<PingOutcome, ArtifactoryError> {
+        self.ping_detailed().await
+    }
+
     async fn get_version(&self) -> Result<SystemVersionResponse, ArtifactoryError> {
         self.get_version().await
     }
@@ -899,6 +923,56 @@ mod tests {
         assert_eq!(config.buffered_timeout_secs, 300);
         // A source restart must not permanently fail in-flight downloads.
         assert!(config.retry_config.max_retries > 0);
+    }
+
+    /// A stored `https://nexus.example.com/` must not turn every request into
+    /// `//service/rest/...`, which Nexus answers with 404 (#5479).
+    #[tokio::test]
+    async fn test_trailing_slash_base_url_is_normalized() {
+        use wiremock::matchers::basic_auth;
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/service/rest/v1/status/writable"))
+            .and(basic_auth("namecode", "passcode"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = NexusClient::new(NexusClientConfig {
+            base_url: format!("{}/", server.uri()),
+            auth: NexusAuth {
+                username: "namecode".into(),
+                password: "passcode".into(),
+            },
+            throttle_delay_ms: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(client.config.base_url, server.uri());
+        assert!(client.ping().await.expect("ping must not error"));
+    }
+
+    #[tokio::test]
+    async fn test_ping_detailed_reports_probed_url_and_status() {
+        let (server, client) = setup_nexus_mock(
+            "/service/rest/v1/status/writable",
+            ResponseTemplate::new(503),
+        )
+        .await;
+        match client.ping_detailed().await.expect("ping must not error") {
+            PingOutcome::Unsuccessful { probes } => {
+                assert_eq!(probes.len(), 1);
+                assert_eq!(
+                    probes[0].url,
+                    format!("{}/service/rest/v1/status/writable", server.uri())
+                );
+                assert_eq!(probes[0].status, 503);
+            }
+            PingOutcome::Reachable => panic!("503 is not reachable"),
+        }
+        assert!(!client.ping().await.expect("ping must not error"));
     }
 
     /// Fast backoff so the retry tests do not sleep for seconds.

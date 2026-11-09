@@ -27,9 +27,10 @@ use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::migration::{is_terminal_status, reported_progress_percent, MigrationConfig};
 use crate::services::artifactory_client::{
-    ArtifactoryAuth, ArtifactoryClient, ArtifactoryClientConfig,
+    ArtifactoryAuth, ArtifactoryClient, ArtifactoryClientConfig, ArtifactoryError,
 };
 use crate::services::encryption::{decrypt_credentials, encrypt_credentials};
+use crate::services::proxy_service::redact_url_for_diagnostics;
 
 /// Built-in fallback passphrase used to seed the credential-encryption key
 /// when `MIGRATION_ENCRYPTION_KEY` is not configured. Connections created
@@ -70,7 +71,9 @@ fn migration_encryption_key() -> Result<String> {
 use crate::services::migration_service::MigrationService;
 use crate::services::migration_worker::{ConflictResolution, MigrationWorker, WorkerConfig};
 use crate::services::nexus_client::{NexusAuth, NexusClient, NexusClientConfig};
-use crate::services::source_registry::SourceRegistry;
+use crate::services::source_registry::{
+    normalize_source_base_url, PingOutcome, PingProbe, SourceRegistry,
+};
 
 use crate::api::validation::validate_outbound_url;
 
@@ -197,31 +200,138 @@ pub struct MigrationReportRow {
 /// `020_migration_tables.sql`.
 const ALLOWED_CONNECTION_AUTH_TYPES: [&str; 2] = ["api_token", "basic_auth"];
 
+/// Source types [`create_source_client`] can build a client for. Anything else
+/// used to be stored and then silently treated as Artifactory (#5479).
+const ALLOWED_CONNECTION_SOURCE_TYPES: [&str; 2] = ["artifactory", "nexus"];
+
+/// Source type a connection gets when the request names none.
+const DEFAULT_CONNECTION_SOURCE_TYPE: &str = "artifactory";
+
+/// Reject a `field` value outside `allowed` with a clear HTTP 400
+/// (`AppError::Validation`).
+fn validate_allowed_value(field: &str, value: &str, allowed: &[&str]) -> Result<()> {
+    if allowed.contains(&value) {
+        Ok(())
+    } else {
+        Err(AppError::Validation(format!(
+            "invalid {} '{}'; must be one of: {}",
+            field,
+            value,
+            allowed.join(", ")
+        )))
+    }
+}
+
 /// Reject any `auth_type` the database CHECK constraint would refuse, mapping
 /// it to a clear HTTP 400 (`AppError::Validation`) instead of letting the
 /// constraint violation surface as an opaque 500 DATABASE_ERROR.
 fn validate_connection_auth_type(auth_type: &str) -> Result<()> {
-    if ALLOWED_CONNECTION_AUTH_TYPES.contains(&auth_type) {
-        Ok(())
-    } else {
-        Err(AppError::Validation(format!(
-            "invalid auth_type '{}'; must be one of: {}",
-            auth_type,
-            ALLOWED_CONNECTION_AUTH_TYPES.join(", ")
-        )))
+    validate_allowed_value("auth_type", auth_type, &ALLOWED_CONNECTION_AUTH_TYPES)
+}
+
+/// Reject a `source_type` no source client exists for (#5479).
+fn validate_connection_source_type(source_type: &str) -> Result<()> {
+    validate_allowed_value("source_type", source_type, &ALLOWED_CONNECTION_SOURCE_TYPES)
+}
+
+/// A credential field the chosen auth type needs, or a message naming it.
+/// Blank counts as missing: it would only reach the source as an empty
+/// credential.
+fn required_credential(value: &Option<String>, what: &str) -> std::result::Result<String, String> {
+    match value {
+        Some(v) if !v.trim().is_empty() => Ok(v.clone()),
+        _ => Err(format!("{what} missing from credentials")),
+    }
+}
+
+/// Artifactory auth for a connection's `auth_type` and decrypted credentials.
+fn artifactory_auth(
+    auth_type: &str,
+    creds: &ConnectionCredentials,
+) -> std::result::Result<ArtifactoryAuth, String> {
+    match auth_type {
+        "api_token" => Ok(ArtifactoryAuth::ApiToken(required_credential(
+            &creds.token,
+            "API token",
+        )?)),
+        "basic_auth" => Ok(ArtifactoryAuth::BasicAuth {
+            username: required_credential(&creds.username, "Username")?,
+            password: required_credential(&creds.password, "Password")?,
+        }),
+        other => Err(format!("Unknown auth type: {}", other)),
+    }
+}
+
+/// Nexus auth for a connection's `auth_type` and decrypted credentials.
+///
+/// Nexus has no single-value API token: a Nexus user token is a name code and
+/// a passcode, presented as Basic credentials. For `api_token` the name code
+/// goes in `username` and the passcode in `token`. This used to read only
+/// `username`/`password` whatever the auth type, so an `api_token` connection
+/// silently sent empty credentials (#5479).
+fn nexus_auth(
+    auth_type: &str,
+    creds: &ConnectionCredentials,
+) -> std::result::Result<NexusAuth, String> {
+    let (username, password) = match auth_type {
+        "api_token" => (
+            required_credential(&creds.username, "Nexus user token name (username)")?,
+            required_credential(&creds.token, "Nexus user token passcode (token)")?,
+        ),
+        "basic_auth" => (
+            required_credential(&creds.username, "Username")?,
+            required_credential(&creds.password, "Password")?,
+        ),
+        other => return Err(format!("Unknown auth type: {}", other)),
+    };
+    Ok(NexusAuth { username, password })
+}
+
+/// Check that `creds` carry what `auth_type` needs for `source_type`, so a
+/// connection that could only ever authenticate with empty credentials is
+/// refused with a 400 when it is created rather than failing later.
+fn validate_connection_credentials(
+    source_type: &str,
+    auth_type: &str,
+    creds: &ConnectionCredentials,
+) -> Result<()> {
+    let checked = match source_type {
+        "nexus" => nexus_auth(auth_type, creds).map(drop),
+        _ => artifactory_auth(auth_type, creds).map(drop),
+    };
+    checked.map_err(|e| AppError::Validation(format!("invalid credentials: {e}")))
+}
+
+/// Display name of a connection's source type, for user-facing messages.
+/// Mirrors [`create_source_client`], which builds an Artifactory client for
+/// anything that is not `nexus`.
+fn source_type_label(source_type: &str) -> &'static str {
+    match source_type {
+        "nexus" => "Nexus",
+        _ => "Artifactory",
     }
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateConnectionRequest {
     pub name: String,
+    /// Base URL of the source. Surrounding whitespace and trailing slashes
+    /// are removed before it is stored.
     pub url: String,
+    /// `api_token` or `basic_auth`. See [`ConnectionCredentials`] for the
+    /// fields each needs.
     pub auth_type: String,
     pub credentials: ConnectionCredentials,
     /// Source registry type: "artifactory" (default) or "nexus"
     pub source_type: Option<String>,
 }
 
+/// Credentials for a source connection.
+///
+/// - Artifactory `api_token`: `token`.
+/// - Artifactory / Nexus `basic_auth`: `username` and `password`.
+/// - Nexus `api_token`: a Nexus user token, with its name code in `username`
+///   and its passcode in `token`.
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
 pub struct ConnectionCredentials {
     pub token: Option<String>,
@@ -258,8 +368,87 @@ impl From<SourceConnectionRow> for ConnectionResponse {
 pub struct ConnectionTestResult {
     pub success: bool,
     pub message: String,
+    /// Source type the connection was tested as: "artifactory" or "nexus".
+    pub source_type: String,
+    /// Version the source reported, when it reported one.
+    pub version: Option<String>,
+    /// Same value as `version`. Kept for existing clients; despite the name
+    /// it is filled for every source type.
+    #[schema(deprecated)]
     pub artifactory_version: Option<String>,
     pub license_type: Option<String>,
+}
+
+impl ConnectionTestResult {
+    fn succeeded(
+        source_type: &str,
+        message: &str,
+        version: Option<String>,
+        license_type: Option<String>,
+    ) -> Self {
+        Self {
+            success: true,
+            message: message.into(),
+            source_type: source_type.into(),
+            artifactory_version: version.clone(),
+            version,
+            license_type,
+        }
+    }
+
+    fn failed(source_type: &str, message: String) -> Self {
+        Self {
+            success: false,
+            message,
+            source_type: source_type.into(),
+            version: None,
+            artifactory_version: None,
+            license_type: None,
+        }
+    }
+}
+
+/// Connection-test message for a source that answered every ping probe, but
+/// never successfully: which source, which URL, which HTTP status (#5479).
+fn unsuccessful_ping_message(label: &str, probes: &[PingProbe]) -> String {
+    if probes.is_empty() {
+        return format!("{label} ping returned an unsuccessful response");
+    }
+    let answers: Vec<String> = probes
+        .iter()
+        .map(|p| {
+            let reason = StatusCode::from_u16(p.status)
+                .ok()
+                .and_then(|s| s.canonical_reason())
+                .map(|r| format!(" {r}"))
+                .unwrap_or_default();
+            format!("{} returned HTTP {}{}", p.url, p.status, reason)
+        })
+        .collect();
+    format!("{label} ping to {}", answers.join(", "))
+}
+
+/// Connection-test message for a ping that failed below HTTP. A transport
+/// error's URL is the stored connection URL, which may carry `user:pass@`
+/// userinfo, so it is redacted (#2926); the error's cause chain is kept,
+/// since "error sending request" alone does not say what went wrong.
+fn ping_error_message(label: &str, err: ArtifactoryError) -> String {
+    let ArtifactoryError::HttpError(err) = err else {
+        return format!("{label} connection failed: {err}");
+    };
+    let url = err.url().map(|u| redact_url_for_diagnostics(u.as_str()));
+    let err = err.without_url();
+    let mut detail = err.to_string();
+    let mut source = std::error::Error::source(&err);
+    while let Some(cause) = source {
+        detail.push_str(": ");
+        detail.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    match url {
+        Some(url) => format!("{label} connection to {url} failed: {detail}"),
+        None => format!("{label} connection failed: {detail}"),
+    }
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -670,8 +859,12 @@ async fn create_connection(
     Extension(auth): Extension<AuthExtension>,
     Json(req): Json<CreateConnectionRequest>,
 ) -> Result<(StatusCode, Json<ConnectionResponse>)> {
+    // Stored normalized: every client builds `{url}{path}`, and a trailing
+    // slash made those `//service/...`, which Nexus 404s (#5479).
+    let url = normalize_source_base_url(&req.url);
+
     // Validate URL to prevent SSRF when migration fetches from this source
-    validate_outbound_url(&req.url, "Migration source URL")?;
+    validate_outbound_url(&url, "Migration source URL")?;
 
     // Validate auth_type against the values permitted by the
     // `source_connections_auth_type_check` CHECK constraint (migration
@@ -679,6 +872,12 @@ async fn create_connection(
     // INSERT and surfaced the constraint violation as an opaque HTTP 500
     // DATABASE_ERROR instead of a clear 400.
     validate_connection_auth_type(&req.auth_type)?;
+    let source_type = req
+        .source_type
+        .as_deref()
+        .unwrap_or(DEFAULT_CONNECTION_SOURCE_TYPE);
+    validate_connection_source_type(source_type)?;
+    validate_connection_credentials(source_type, &req.auth_type, &req.credentials)?;
 
     // Encrypt credentials before storing
     let credentials_json = serde_json::to_string(&req.credentials)?;
@@ -693,10 +892,10 @@ async fn create_connection(
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING {SOURCE_CONNECTION_COLUMNS}"
     )))
     .bind(&req.name)
-    .bind(&req.url)
+    .bind(&url)
     .bind(&req.auth_type)
     .bind(&credentials_enc)
-    .bind(req.source_type.as_deref().unwrap_or("artifactory"))
+    .bind(source_type)
     .bind(auth.user_id)
     .fetch_one(&state.db)
     .await?;
@@ -788,7 +987,7 @@ async fn delete_connection(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Test connection to Artifactory
+/// Test connection to a migration source (Artifactory or Nexus)
 #[utoipa::path(
     post,
     path = "/connections/{id}/test",
@@ -810,52 +1009,32 @@ async fn test_connection(
     Path(id): Path<Uuid>,
 ) -> Result<Json<ConnectionTestResult>> {
     let connection = load_connection_owned(&state, &auth, id).await?;
+    let source_type = connection.source_type.as_str();
+    let label = source_type_label(source_type);
 
-    // Create source registry client
-    let client = match create_source_client(&connection, None) {
-        Ok(c) => c,
+    let result = match create_source_client(&connection, None) {
         Err(e) => {
-            return Ok(Json(ConnectionTestResult {
-                success: false,
-                message: format!("Failed to create client: {}", e),
-                artifactory_version: None,
-                license_type: None,
-            }));
+            ConnectionTestResult::failed(source_type, format!("Failed to create client: {}", e))
         }
-    };
-
-    // Test the connection by pinging and getting version
-    let ping_result = client.ping().await;
-
-    let result = match ping_result {
-        Ok(true) => {
-            // Try to get version info
-            match client.get_version().await {
-                Ok(version_info) => ConnectionTestResult {
-                    success: true,
-                    message: "Connection successful".into(),
-                    artifactory_version: Some(version_info.version),
-                    license_type: version_info.license,
-                },
-                Err(_) => ConnectionTestResult {
-                    success: true,
-                    message: "Connection successful (version info unavailable)".into(),
-                    artifactory_version: None,
-                    license_type: None,
-                },
+        Ok(client) => match client.ping_detailed().await {
+            Ok(PingOutcome::Reachable) => match client.get_version().await {
+                Ok(version_info) => ConnectionTestResult::succeeded(
+                    source_type,
+                    "Connection successful",
+                    Some(version_info.version),
+                    version_info.license,
+                ),
+                Err(_) => ConnectionTestResult::succeeded(
+                    source_type,
+                    "Connection successful (version info unavailable)",
+                    None,
+                    None,
+                ),
+            },
+            Ok(PingOutcome::Unsuccessful { probes }) => {
+                ConnectionTestResult::failed(source_type, unsuccessful_ping_message(label, &probes))
             }
-        }
-        Ok(false) => ConnectionTestResult {
-            success: false,
-            message: "Artifactory ping returned unsuccessful response".into(),
-            artifactory_version: None,
-            license_type: None,
-        },
-        Err(e) => ConnectionTestResult {
-            success: false,
-            message: format!("Connection failed: {}", e),
-            artifactory_version: None,
-            license_type: None,
+            Err(e) => ConnectionTestResult::failed(source_type, ping_error_message(label, e)),
         },
     };
 
@@ -865,9 +1044,32 @@ async fn test_connection(
             .bind(id)
             .execute(&state.db)
             .await;
+    } else {
+        tracing::warn!(
+            connection_id = %id,
+            source_type = %source_type,
+            message = %result.message,
+            "Migration source connection test failed"
+        );
     }
 
     Ok(Json(result))
+}
+
+/// Decrypt and parse a connection's stored credentials.
+///
+/// Uses `migration_encryption_key`, whose dev-passphrase fallback matches the
+/// one `create_connection` encrypted under, so rows written under it stay
+/// decryptable.
+fn connection_credentials(
+    connection: &SourceConnectionRow,
+) -> std::result::Result<ConnectionCredentials, String> {
+    let encryption_key =
+        migration_encryption_key().map_err(|e| format!("Failed to load encryption key: {}", e))?;
+    let credentials_json = decrypt_credentials(&connection.credentials_enc, &encryption_key)
+        .map_err(|e| format!("Failed to decrypt credentials: {}", e))?;
+    serde_json::from_str(&credentials_json)
+        .map_err(|e| format!("Failed to parse credentials: {}", e))
 }
 
 /// Create the appropriate source registry client based on connection type
@@ -881,23 +1083,12 @@ fn create_source_client(
 ) -> std::result::Result<Arc<dyn SourceRegistry>, String> {
     match connection.source_type.as_str() {
         "nexus" => {
-            // Mirrors `migration_encryption_key`: fall back to the dev
-            // passphrase if the env var is unset so we can decrypt rows
-            // written by `create_connection` under the same fallback.
-            let encryption_key = migration_encryption_key()
-                .map_err(|e| format!("Failed to load encryption key: {}", e))?;
-            let credentials_json =
-                decrypt_credentials(&connection.credentials_enc, &encryption_key)
-                    .map_err(|e| format!("Failed to decrypt credentials: {}", e))?;
-            let creds: ConnectionCredentials = serde_json::from_str(&credentials_json)
-                .map_err(|e| format!("Failed to parse credentials: {}", e))?;
-
+            let creds = connection_credentials(connection)?;
             let config = NexusClientConfig {
+                // The client normalizes it, so rows stored before #5479 with
+                // a trailing slash work too.
                 base_url: connection.url.clone(),
-                auth: NexusAuth {
-                    username: creds.username.unwrap_or_default(),
-                    password: creds.password.unwrap_or_default(),
-                },
+                auth: nexus_auth(&connection.auth_type, &creds)?,
                 cancel_token: cancel.cloned().unwrap_or_default(),
                 ..Default::default()
             };
@@ -917,40 +1108,10 @@ fn create_source_client(
 fn create_artifactory_client(
     connection: &SourceConnectionRow,
 ) -> std::result::Result<ArtifactoryClient, String> {
-    // Decrypt credentials. Mirrors `migration_encryption_key`'s fallback
-    // so connections persisted under the built-in dev passphrase remain
-    // decryptable from this code path too.
-    let encryption_key =
-        migration_encryption_key().map_err(|e| format!("Failed to load encryption key: {}", e))?;
-
-    let credentials_json = decrypt_credentials(&connection.credentials_enc, &encryption_key)
-        .map_err(|e| format!("Failed to decrypt credentials: {}", e))?;
-
-    let creds: ConnectionCredentials = serde_json::from_str(&credentials_json)
-        .map_err(|e| format!("Failed to parse credentials: {}", e))?;
-
-    let auth = match connection.auth_type.as_str() {
-        "api_token" => {
-            let token = creds
-                .token
-                .ok_or_else(|| "API token missing from credentials".to_string())?;
-            ArtifactoryAuth::ApiToken(token)
-        }
-        "basic_auth" => {
-            let username = creds
-                .username
-                .ok_or_else(|| "Username missing from credentials".to_string())?;
-            let password = creds
-                .password
-                .ok_or_else(|| "Password missing from credentials".to_string())?;
-            ArtifactoryAuth::BasicAuth { username, password }
-        }
-        other => return Err(format!("Unknown auth type: {}", other)),
-    };
-
+    let creds = connection_credentials(connection)?;
     let config = ArtifactoryClientConfig {
         base_url: connection.url.clone(),
-        auth,
+        auth: artifactory_auth(&connection.auth_type, &creds)?,
         ..Default::default()
     };
 
@@ -2316,28 +2477,224 @@ mod tests {
 
     #[test]
     fn test_connection_test_result_success() {
-        let result = ConnectionTestResult {
-            success: true,
-            message: "Connection successful".to_string(),
-            artifactory_version: Some("7.55.0".to_string()),
-            license_type: Some("Enterprise".to_string()),
-        };
+        let result = ConnectionTestResult::succeeded(
+            "artifactory",
+            "Connection successful",
+            Some("7.55.0".to_string()),
+            Some("Enterprise".to_string()),
+        );
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["success"], true);
+        assert_eq!(json["source_type"], "artifactory");
+        assert_eq!(json["version"], "7.55.0");
+        // Deprecated alias keeps existing clients working.
         assert_eq!(json["artifactory_version"], "7.55.0");
     }
 
     #[test]
     fn test_connection_test_result_failure() {
-        let result = ConnectionTestResult {
-            success: false,
-            message: "Connection failed: timeout".to_string(),
-            artifactory_version: None,
-            license_type: None,
-        };
+        let result =
+            ConnectionTestResult::failed("nexus", "Nexus connection failed: timeout".to_string());
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["success"], false);
+        assert_eq!(json["source_type"], "nexus");
+        assert!(json["version"].is_null());
         assert!(json["artifactory_version"].is_null());
+    }
+
+    // -----------------------------------------------------------------------
+    // Source-type / credential validation and test messages (#5479)
+    // -----------------------------------------------------------------------
+
+    fn creds(
+        token: Option<&str>,
+        username: Option<&str>,
+        password: Option<&str>,
+    ) -> ConnectionCredentials {
+        ConnectionCredentials {
+            token: token.map(Into::into),
+            username: username.map(Into::into),
+            password: password.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn test_validate_connection_source_type() {
+        for (source_type, ok) in [
+            ("artifactory", true),
+            ("nexus", true),
+            ("Nexus", false),
+            ("nexus3", false),
+            ("", false),
+        ] {
+            let result = validate_connection_source_type(source_type);
+            assert_eq!(result.is_ok(), ok, "{source_type:?}: {result:?}");
+            if !ok {
+                assert!(matches!(result, Err(AppError::Validation(_))));
+            }
+        }
+    }
+
+    #[test]
+    fn test_nexus_api_token_is_name_and_passcode_basic_credentials() {
+        let auth = nexus_auth(
+            "api_token",
+            &creds(Some("passcode"), Some("namecode"), None),
+        )
+        .expect("complete user token");
+        assert_eq!(auth.username, "namecode");
+        assert_eq!(auth.password, "passcode");
+    }
+
+    #[test]
+    fn test_nexus_basic_auth_uses_username_and_password() {
+        let auth = nexus_auth("basic_auth", &creds(Some("ignored"), Some("u"), Some("p")))
+            .expect("complete basic auth");
+        assert_eq!(auth.username, "u");
+        assert_eq!(auth.password, "p");
+    }
+
+    #[test]
+    fn test_nexus_auth_never_falls_back_to_empty_credentials() {
+        let cases = [
+            (
+                "api_token",
+                creds(Some("passcode"), None, None),
+                "token name",
+            ),
+            ("api_token", creds(None, Some("namecode"), None), "passcode"),
+            // A password is not the passcode: api_token reads `token`.
+            (
+                "api_token",
+                creds(None, Some("namecode"), Some("p")),
+                "passcode",
+            ),
+            (
+                "api_token",
+                creds(Some("  "), Some("namecode"), None),
+                "passcode",
+            ),
+            ("basic_auth", creds(Some("t"), None, None), "Username"),
+            ("basic_auth", creds(None, Some("u"), Some("")), "Password"),
+            (
+                "bearer",
+                creds(Some("t"), Some("u"), Some("p")),
+                "Unknown auth type",
+            ),
+        ];
+        for (auth_type, c, expected) in cases {
+            let err = nexus_auth(auth_type, &c).expect_err(auth_type);
+            assert!(err.contains(expected), "{auth_type} {c:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_artifactory_auth_requires_matching_credentials() {
+        assert!(matches!(
+            artifactory_auth("api_token", &creds(Some("t"), None, None)),
+            Ok(ArtifactoryAuth::ApiToken(t)) if t == "t"
+        ));
+        assert!(matches!(
+            artifactory_auth("basic_auth", &creds(None, Some("u"), Some("p"))),
+            Ok(ArtifactoryAuth::BasicAuth { username, password }) if username == "u" && password == "p"
+        ));
+        let err = artifactory_auth("api_token", &creds(None, Some("u"), Some("p"))).unwrap_err();
+        assert!(err.contains("API token"), "{err}");
+        let err = artifactory_auth("basic_auth", &creds(Some("t"), Some("u"), None)).unwrap_err();
+        assert!(err.contains("Password"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_connection_credentials_by_source_type() {
+        // The same body is valid for Artifactory and incomplete for Nexus,
+        // which also needs the user token's name code.
+        let token_only = creds(Some("t"), None, None);
+        assert!(validate_connection_credentials("artifactory", "api_token", &token_only).is_ok());
+        assert!(matches!(
+            validate_connection_credentials("nexus", "api_token", &token_only),
+            Err(AppError::Validation(_))
+        ));
+        assert!(validate_connection_credentials(
+            "nexus",
+            "api_token",
+            &creds(Some("t"), Some("n"), None)
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_source_type_label() {
+        assert_eq!(source_type_label("nexus"), "Nexus");
+        assert_eq!(source_type_label("artifactory"), "Artifactory");
+        // Mirrors create_source_client's Artifactory fallback.
+        assert_eq!(source_type_label("legacy"), "Artifactory");
+    }
+
+    #[test]
+    fn test_unsuccessful_ping_message_names_source_url_and_status() {
+        let probes = [PingProbe {
+            url: "https://nexus.example.com/service/rest/v1/status/writable".into(),
+            status: 404,
+        }];
+        assert_eq!(
+            unsuccessful_ping_message("Nexus", &probes),
+            "Nexus ping to https://nexus.example.com/service/rest/v1/status/writable \
+             returned HTTP 404 Not Found"
+        );
+
+        let probes = [
+            PingProbe {
+                url: "https://a/api/system/ping".into(),
+                status: 404,
+            },
+            PingProbe {
+                url: "https://a/access/api/v1/system/ping".into(),
+                status: 401,
+            },
+        ];
+        assert_eq!(
+            unsuccessful_ping_message("Artifactory", &probes),
+            "Artifactory ping to https://a/api/system/ping returned HTTP 404 Not Found, \
+             https://a/access/api/v1/system/ping returned HTTP 401 Unauthorized"
+        );
+
+        assert_eq!(
+            unsuccessful_ping_message("Nexus", &[]),
+            "Nexus ping returned an unsuccessful response"
+        );
+    }
+
+    #[test]
+    fn test_ping_error_message_non_transport_error() {
+        let msg = ping_error_message(
+            "Nexus",
+            ArtifactoryError::AuthError("Nexus authentication failed: 401".into()),
+        );
+        assert_eq!(
+            msg,
+            "Nexus connection failed: Authentication failed: Nexus authentication failed: 401"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ping_error_message_redacts_url_and_keeps_cause() {
+        // Nothing listens on port 1, so this fails at connect time.
+        let err = reqwest::Client::new()
+            .get("http://user:secret@127.0.0.1:1/service/rest/v1/status/writable")
+            .send()
+            .await
+            .expect_err("connect must fail");
+        let msg = ping_error_message("Nexus", ArtifactoryError::HttpError(err));
+        assert!(
+            msg.starts_with(
+                "Nexus connection to http://127.0.0.1:1/service/rest/v1/status/writable failed: "
+            ),
+            "{msg}"
+        );
+        assert!(!msg.contains("secret"), "credentials leaked: {msg}");
+        assert!(!msg.contains("user:"), "userinfo leaked: {msg}");
+        // The cause chain says why, not just "error sending request".
+        assert!(msg.matches(": ").count() >= 2, "{msg}");
     }
 
     // -----------------------------------------------------------------------
@@ -3106,6 +3463,229 @@ mod tests {
         assert_eq!(v["pagination"]["total"], 7, "unfiltered total is unchanged");
 
         cleanup_user(&pool, victor).await;
+        cleanup_user(&pool, marco).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Nexus source connections end to end (#5479)
+    // -----------------------------------------------------------------------
+
+    /// POST a create-connection body as `user`; returns status and JSON body.
+    async fn post_connection(
+        state: SharedState,
+        user: Uuid,
+        username: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let (status, bytes) = tdh::send(
+            app_as(state, tdh::make_auth(user, username)),
+            Request::builder()
+                .method(Method::POST)
+                .uri("/connections")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+        (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    /// Seed a Nexus connection with real, decryptable credentials, the way a
+    /// pre-#5479 row could look (`url` stored with its trailing slash).
+    async fn seed_nexus_connection(
+        pool: &sqlx::PgPool,
+        owner: Uuid,
+        url: &str,
+        auth_type: &str,
+        credentials: &ConnectionCredentials,
+    ) -> Uuid {
+        let key = migration_encryption_key().unwrap();
+        let enc = encrypt_credentials(&serde_json::to_string(credentials).unwrap(), &key);
+        sqlx::query_scalar(
+            "INSERT INTO source_connections (name, url, auth_type, credentials_enc, source_type, created_by) \
+             VALUES ($1, $2, $3, $4, 'nexus', $5) RETURNING id",
+        )
+        .bind(format!("nexus-conn-{}", Uuid::new_v4()))
+        .bind(url)
+        .bind(auth_type)
+        .bind(enc)
+        .bind(owner)
+        .fetch_one(pool)
+        .await
+        .expect("seed nexus connection")
+    }
+
+    async fn post_test_connection(
+        state: SharedState,
+        user: Uuid,
+        username: &str,
+        conn: Uuid,
+    ) -> serde_json::Value {
+        let (status, bytes) = tdh::send(
+            app_as(state, tdh::make_auth(user, username)),
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/connections/{conn}/test"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_create_connection_normalizes_url_and_validates_nexus_auth() {
+        let Some(pool) = tdh::try_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (marco, marco_name) = tdh::create_user(&pool).await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let body = |source_type: &str, auth_type: &str, credentials: serde_json::Value| {
+            serde_json::json!({
+                "name": format!("conn-{}", Uuid::new_v4()),
+                "url": " https://nexus.example.com/ ",
+                "auth_type": auth_type,
+                "credentials": credentials,
+                "source_type": source_type,
+            })
+        };
+
+        // A user token without its name code would only ever send empty
+        // Basic credentials: refused up front.
+        let (status, v) = post_connection(
+            state.clone(),
+            marco,
+            &marco_name,
+            body(
+                "nexus",
+                "api_token",
+                serde_json::json!({"token": "passcode"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+
+        // An unknown source type is no longer stored as a silent Artifactory.
+        let (status, v) = post_connection(
+            state.clone(),
+            marco,
+            &marco_name,
+            body(
+                "nexus3",
+                "basic_auth",
+                serde_json::json!({"username": "u", "password": "p"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+
+        let (status, v) = post_connection(
+            state,
+            marco,
+            &marco_name,
+            body(
+                "nexus",
+                "api_token",
+                serde_json::json!({"username": "namecode", "token": "passcode"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{v}");
+        assert_eq!(
+            v["url"], "https://nexus.example.com",
+            "url stored normalized"
+        );
+        assert_eq!(v["source_type"], "nexus");
+
+        cleanup_user(&pool, marco).await;
+    }
+
+    #[tokio::test]
+    async fn test_nexus_connection_test_with_trailing_slash_and_user_token() {
+        use wiremock::matchers::{basic_auth, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let server = MockServer::start().await;
+        // Only the single-slash path with the user token as Basic credentials
+        // answers; `//service/...` or empty credentials fall through to 404.
+        Mock::given(method("GET"))
+            .and(path("/service/rest/v1/status/writable"))
+            .and(basic_auth("namecode", "passcode"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/service/rest/v1/status"))
+            .and(basic_auth("namecode", "passcode"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"edition": "OSS", "version": "3.70.1"})),
+            )
+            .mount(&server)
+            .await;
+
+        let (marco, marco_name) = tdh::create_user(&pool).await;
+        let conn = seed_nexus_connection(
+            &pool,
+            marco,
+            &format!("{}/", server.uri()),
+            "api_token",
+            &creds(Some("passcode"), Some("namecode"), None),
+        )
+        .await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+
+        let v = post_test_connection(state, marco, &marco_name, conn).await;
+        assert_eq!(v["success"], true, "{v}");
+        assert_eq!(v["source_type"], "nexus");
+        assert_eq!(v["version"], "3.70.1");
+        assert_eq!(v["artifactory_version"], "3.70.1");
+
+        cleanup_user(&pool, marco).await;
+    }
+
+    #[tokio::test]
+    async fn test_nexus_connection_test_failure_names_nexus_url_and_status() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let (marco, marco_name) = tdh::create_user(&pool).await;
+        let conn = seed_nexus_connection(
+            &pool,
+            marco,
+            &server.uri(),
+            "basic_auth",
+            &creds(None, Some("u"), Some("p")),
+        )
+        .await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+
+        let v = post_test_connection(state, marco, &marco_name, conn).await;
+        assert_eq!(v["success"], false, "{v}");
+        assert_eq!(v["source_type"], "nexus");
+        assert_eq!(
+            v["message"],
+            format!(
+                "Nexus ping to {}/service/rest/v1/status/writable returned HTTP 404 Not Found",
+                server.uri()
+            )
+        );
+
         cleanup_user(&pool, marco).await;
     }
 

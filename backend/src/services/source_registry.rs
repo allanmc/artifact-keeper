@@ -104,6 +104,41 @@ pub fn validate_oci_content_ref(image: &str, digest: &str) -> Result<(), Artifac
     Ok(())
 }
 
+/// Canonical form of a source registry base URL: surrounding whitespace and
+/// trailing slashes removed (#5479).
+///
+/// Both source clients build request URLs as `format!("{base}{path}")` with
+/// `path` starting at `/`, so a base entered as `https://nexus.example.com/`
+/// produced `//service/rest/...`, which Nexus answers with 404.
+pub fn normalize_source_base_url(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_string()
+}
+
+/// One connectivity probe a source client made that did not succeed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PingProbe {
+    /// The probed URL, with userinfo, query and fragment redacted (#2926).
+    pub url: String,
+    /// The HTTP status the source answered with.
+    pub status: u16,
+}
+
+/// What [`SourceRegistry::ping_detailed`] saw (#5479).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PingOutcome {
+    /// The source answered a probe successfully.
+    Reachable,
+    /// The source answered, but never successfully. `probes` lists each probe
+    /// made, in order; it is empty when the client cannot tell.
+    Unsuccessful { probes: Vec<PingProbe> },
+}
+
+impl PingOutcome {
+    pub fn is_reachable(&self) -> bool {
+        matches!(self, PingOutcome::Reachable)
+    }
+}
+
 /// Page size of the listing walk [`SourceRegistry::count_artifacts`] runs.
 pub const COUNT_PAGE_SIZE: i64 = 1000;
 
@@ -171,6 +206,18 @@ pub async fn count_by_listing<S: SourceRegistry + ?Sized>(
 pub trait SourceRegistry: Send + Sync {
     /// Check connectivity
     async fn ping(&self) -> Result<bool, ArtifactoryError>;
+
+    /// Check connectivity, reporting which URLs were probed and the HTTP
+    /// status each answered with, so a failed connection test can say why
+    /// (#5479). The default wraps [`ping`](Self::ping) without that detail;
+    /// the real source clients override it.
+    async fn ping_detailed(&self) -> Result<PingOutcome, ArtifactoryError> {
+        Ok(if self.ping().await? {
+            PingOutcome::Reachable
+        } else {
+            PingOutcome::Unsuccessful { probes: Vec::new() }
+        })
+    }
 
     /// Get version information
     async fn get_version(&self) -> Result<SystemVersionResponse, ArtifactoryError>;
@@ -531,6 +578,35 @@ mod tests {
     async fn test_mock_ping_failure() {
         let registry = MockSourceRegistry::new("artifactory").with_ping(false);
         assert!(!registry.ping().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_default_ping_detailed_wraps_ping() {
+        let registry = MockSourceRegistry::new("artifactory");
+        assert_eq!(
+            registry.ping_detailed().await.unwrap(),
+            PingOutcome::Reachable
+        );
+        let registry = MockSourceRegistry::new("artifactory").with_ping(false);
+        let outcome = registry.ping_detailed().await.unwrap();
+        assert!(!outcome.is_reachable());
+        assert_eq!(outcome, PingOutcome::Unsuccessful { probes: vec![] });
+    }
+
+    #[test]
+    fn test_normalize_source_base_url() {
+        for (input, expected) in [
+            ("https://nexus.example.com/", "https://nexus.example.com"),
+            ("https://nexus.example.com//", "https://nexus.example.com"),
+            (
+                "  https://nexus.example.com/nexus/ ",
+                "https://nexus.example.com/nexus",
+            ),
+            ("https://nexus.example.com", "https://nexus.example.com"),
+            ("", ""),
+        ] {
+            assert_eq!(normalize_source_base_url(input), expected, "{input:?}");
+        }
     }
 
     #[tokio::test]
